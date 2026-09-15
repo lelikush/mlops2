@@ -11,6 +11,7 @@
 import argparse
 import gc
 import json
+import subprocess
 import os
 import platform
 import sys
@@ -25,6 +26,11 @@ from peft import LoraConfig, get_peft_model
 from src.config import load_params
 from src.model import build_prompt, load_model, set_seed
 
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 # Пик RSS снимается разными механизмами на разных ОС, поэтому оба импорта
 # необязательные: resource есть на macOS и Linux, но его нет на Windows;
 # psutil нужен на Windows, где peak_wset — единственный high-water mark,
@@ -99,13 +105,18 @@ def parameter_rows(model) -> list[dict]:
     remove_duplicate=False — иначе в таблицу не попадёт lm_head.
     """
     rows = []
+    seen:set[int] = set()
+
     for name, param in model.named_parameters(remove_duplicate=False):
+        tied = id(param) in seen
+        seen.add(id(param))
         rows.append({
             "name": name,
             "shape": tuple(param.shape),
-            "numel": param.numel(),
-            "tied": False,
+            "numel": 0 if tied else param.numel(),
+            "tied": tied,
         })
+
     return rows
 
 
@@ -159,6 +170,7 @@ def hook_targets(model) -> dict[str, int]:
 def forward_hooks(modules: dict) -> dict:
     """Навесить forward-hooks на модули и вернуть словарь, куда они пишут."""
     store: dict[str, list[float]] = {}
+    handles = []
 
     def make_hook(label: str):
         def hook(module, args, output):
@@ -167,8 +179,8 @@ def forward_hooks(modules: dict) -> dict:
         return hook
 
     for label, module in modules.items():
-        module.register_forward_hook(make_hook(label))
-    return store
+        handles.append(module.register_forward_hook(make_hook(label)))
+    return store, handles
 
 
 def activation_norms(tokenizer, model, params: dict) -> dict:
@@ -178,9 +190,14 @@ def activation_norms(tokenizer, model, params: dict) -> dict:
     prompt = build_prompt(tokenizer, params, params["hooks"]["prompt"])
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-    store = forward_hooks({label: layers[i] for label, i in targets.items()})
-    with torch.inference_mode():
-        model(**inputs)
+    store, handles = forward_hooks({label: layers[i] for label, i in targets.items()})
+
+    try:
+        with torch.inference_mode():
+            model(**inputs)
+    finally:
+        for handle in handles:
+            handle.remove()
 
     return {
         "layers": targets,
@@ -254,12 +271,20 @@ def lora_report(model, params: dict) -> list[dict]:
 
 def device_allocated_bytes(device: torch.device) -> int:
     """Сколько памяти занято прямо сейчас."""
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated(device)
+    if device.type == "mps":
+        return torch.mps.driver_allocated_memory()
     used, _ = peak_rss()
     return used
 
 
 def device_metric_source(device: torch.device) -> str:
     """Имя функции, которой снята память."""
+    if device.type == "cuda":
+        return "torch.cuda.max_memory_allocated"
+    if device.type == "mps":
+        return "torch.mps.driver_allocated_memory"
     _, source = peak_rss()
     return source
 
@@ -304,10 +329,7 @@ class PeakMemory:
         return self
 
     def __exit__(self, *exc) -> bool:
-        # TODO: это расход режима — или то, что осталось занято после него,
-        # когда всё уже посчитано и мусор собран?
-        gc.collect()
-        self.used = device_allocated_bytes(self.device)
+        self.used, _ = peak_rss()
         return False
 
     def result(self) -> dict:
@@ -379,18 +401,33 @@ def measure_mode(mode: str, params: dict) -> dict:
 
 def memory_profile(params: dict) -> list[dict]:
     """Профиль памяти в трёх режимах.
-
-    memory.repeats задаёт число прогонов на режим; берётся худший (максимум).
+    Каждый режим запускается в отдельном процессе, чтобы peak_wset
+    измерял только этот конкретный прогон.
     """
     repeats = max(1, int(params["memory"].get("repeats", 1)))
     results = []
+
     for mode in MODES:
-        runs = [measure_mode(mode, params) for _ in range(repeats)]
+        runs = []
+        for _ in range(repeats):
+            completed = subprocess.run(
+                [sys.executable, "-m", "src.inspect_model", "--probe", mode],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            lines = [
+                line.strip()
+                for line in completed.stdout.splitlines()
+                if line.strip()
+            ]
+            run = json.loads(lines[-1])
+            runs.append(run)
         worst = max(runs, key=lambda item: item["peak_mb"])
         worst["repeats"] = repeats
         worst["peak_mb_runs"] = [item["peak_mb"] for item in runs]
         results.append(worst)
-        gc.collect()
     return results
 
 
